@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.txt
+!requirements.txt
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+sitehealth_report.*
