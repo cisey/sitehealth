@@ -1,8 +1,8 @@
 # sitehealth.pyw — Site Health Checker (AdSense-aware)
 # Single-file, stdlib-only. Python 3.8+.
 #
-# Usage (GUI):  pythonw sitehealth.pyw
-# Usage (CLI):  python sitehealth.pyw https://example.com [--json] [--mode auto|general|adsense]
+# Usage (GUI):  pythonw SiteHealth.py
+# Usage (CLI):  python SiteHealth.py https://example.com [--json] [--mode auto|general|adsense]
 #
 # Modes:
 #   auto     (default) — AdSense checks only if AdSense is detected
@@ -11,6 +11,8 @@
 
 import gzip
 import json
+import ssl
+import socket
 import sys
 import time
 import threading
@@ -21,9 +23,10 @@ import urllib.parse
 import urllib.error
 import re
 from html.parser import HTMLParser
+from datetime import datetime, timezone
 
 APP_NAME = "SiteHealth"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.5.0"
 UA = ("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
       "Chrome/124 Mobile Safari/537.36")
 
@@ -67,6 +70,99 @@ def fetch(url, timeout=20):
         "size": len(raw), "size_compressed": size_compressed,
         "gzip": "gzip" in enc,
     }
+
+
+# ───────────────────────── SSL certificate ─────────────────────────
+def check_ssl(hostname, port=443, timeout=10):
+    """
+    Connects to hostname:port via TLS and reads the peer certificate.
+    Returns dict with:
+      ok           : True if connection+cert fetch succeeded
+      error        : str, if ok is False
+      not_before   : datetime or None
+      not_after    : datetime or None
+      days_left    : int or None (negative if expired)
+      expired      : bool
+      subject      : str (CN or first SAN)
+      issuer       : str (CN of issuer)
+      sans         : list[str]
+    """
+    result = {
+        "ok": False, "error": "",
+        "not_before": None, "not_after": None,
+        "days_left": None, "expired": False,
+        "subject": "", "issuer": "", "sans": [],
+    }
+
+    cert = None
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+    except ssl.SSLCertVerificationError as e:
+        result["error"] = "certificate verification failed: " + str(e)
+        # Try again without verification, only to read expiry info
+        try:
+            ctx2 = ssl._create_unverified_context()
+            with socket.create_connection((hostname, port),
+                                          timeout=timeout) as sock:
+                with ctx2.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert = ssock.getpeercert()
+        except Exception as e2:
+            result["error"] += " (" + str(e2) + ")"
+            return result
+    except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError) as e:
+        result["error"] = str(e)
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    if not cert:
+        result["error"] = "no certificate returned"
+        return result
+
+    result["ok"] = True
+
+    # Parse expiry date (always UTC, format: 'Mar 15 12:00:00 2027 GMT')
+    def parse_dt(s):
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%b %d %H:%M:%S %Y %Z").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    not_before = parse_dt(cert.get("notBefore"))
+    not_after = parse_dt(cert.get("notAfter"))
+    result["not_before"] = not_before
+    result["not_after"] = not_after
+
+    if not_after:
+        now = datetime.now(timezone.utc)
+        delta = not_after - now
+        result["days_left"] = delta.days
+        result["expired"] = delta.total_seconds() < 0
+
+    # Subject
+    subj = dict(x[0] for x in cert.get("subject", ()))
+    result["subject"] = subj.get("commonName", "")
+
+    # Issuer
+    iss = dict(x[0] for x in cert.get("issuer", ()))
+    result["issuer"] = (iss.get("organizationName")
+                        or iss.get("commonName") or "")
+
+    # SANs
+    sans = []
+    for t, v in cert.get("subjectAltName", ()):
+        if t == "DNS":
+            sans.append(v)
+    result["sans"] = sans
+
+    return result
 
 
 # ───────────────────────── HTML parser ─────────────────────────
@@ -244,6 +340,39 @@ def check(url, emit, mode="auto"):
     else:
         emit("bad", "Site is not HTTPS")
 
+    # SSL certificate expiry (only for HTTPS)
+    if p.scheme == "https":
+        host = p.hostname or p.netloc
+        ssl_info = check_ssl(host)
+        if not ssl_info["ok"]:
+            emit("warn", "SSL certificate could not be read: " +
+                         ssl_info.get("error", "unknown error"))
+        else:
+            days = ssl_info["days_left"]
+            date_str = (ssl_info["not_after"].strftime("%Y-%m-%d")
+                        if ssl_info["not_after"] else "?")
+            if ssl_info["expired"]:
+                emit("bad", f"✖ SSL certificate EXPIRED "
+                            f"({abs(days)} days ago) — visitors see "
+                            f"security warnings!")
+            elif days is not None and days < 7:
+                emit("bad", f"✖ SSL certificate expires in {days} day(s) "
+                            f"({date_str}) — renew NOW!")
+            elif days is not None and days < 30:
+                emit("warn", f"SSL certificate expires in {days} days "
+                             f"({date_str}) — renew soon")
+            elif days is not None:
+                emit("ok", f"SSL certificate valid until {date_str} "
+                           f"({days} days left)")
+
+            info_bits = []
+            if ssl_info["subject"]:
+                info_bits.append("issued to: " + ssl_info["subject"])
+            if ssl_info["issuer"]:
+                info_bits.append("issuer: " + ssl_info["issuer"])
+            if info_bits:
+                emit("info", "SSL " + "; ".join(info_bits))
+
     vp = meta("viewport")
     if vp is None:
         emit("bad", "No viewport meta tag (broken on mobile)")
@@ -285,7 +414,6 @@ def check(url, emit, mode="auto"):
         elif ins:
             emit("ok", f"{ins} ad unit(s) found on page")
     elif has_adsense:
-        # general mode but AdSense detected — notify user
         emit("info", "AdSense detected but mode is 'general' — skipping "
                      "AdSense-specific checks.")
 
@@ -686,7 +814,6 @@ def build_gui():
     root.title(f"{APP_NAME} {APP_VERSION}")
     root.geometry("860x840")
 
-    # Use 'clam' theme for consistent ttk look across platforms
     style = ttk.Style()
     try:
         style.theme_use("clam")
